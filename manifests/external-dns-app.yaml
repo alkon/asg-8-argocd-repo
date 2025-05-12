@@ -49,7 +49,7 @@ spec:
                   argocd.argoproj.io/sync-wave: "-1"
               data:
                 setting: "enabled"
-    - repoUrl: https://github.com/alkon/asg-8-argocd-repo.git
+    - repoURL: https://github.com/alkon/asg-8-argocd-repo.git
       path: hook-job
       targetRevision: HEAD
   project: default

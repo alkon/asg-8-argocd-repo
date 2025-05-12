@@ -1,0 +1,62 @@
+#apiVersion: argoproj.io/v1alpha1
+#kind: Application
+#metadata:
+#  name: external-dns-cf
+#  namespace: argocd
+#spec:
+#  destination:
+#    namespace: cert-manager
+#    server: https://kubernetes.default.svc
+#  source:
+#    repoURL: registry-1.docker.io/bitnamicharts
+#    chart: external-dns
+#    targetRevision: 8.8.2
+#  project: default
+#  syncPolicy:
+#    automated:
+#      prune: true
+#      selfHeal: true
+#    syncOptions:
+#      - CreateNamespace=true
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-dns-cf
+  namespace: argocd
+spec:
+  destination:
+    namespace: cert-manager
+    server: https://kubernetes.default.svc
+  sources:
+    - repoURL: registry-1.docker.io/bitnamicharts
+      chart: external-dns
+      targetRevision: 8.8.2
+    helm:
+      values: |
+        extraEnvVars:
+          - name: MY_CONFIG
+            valueFrom:
+              configMapKeyRef:
+                name: external-dns-extra-config
+                key: setting
+
+        extraDeploy:
+          - apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: external-dns-extra-config
+              annotations:
+                argocd.argoproj.io/sync-wave: "-1"
+            data:
+              setting: "enabled"
+    - repoUrl: https://github.com/alkon/asg-8-argocd-repo.git
+      path: hook-job
+      targetRevision: HEAD
+  project: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+

@@ -216,7 +216,236 @@ from one hand we continue to use the OCI registry source, but for managing hook'
   - Note 3: the order of ops:
    a) Argo CD runs PreSync Job from the hook-job folder. b) Then it will pull and apply the external-dns chart from the OCI registry
    c) Namespace cert-manager will be created automatically thanks to CreateNamespace=true.
+  - Note 4: To watch the hook before it deleted possible to change hook-delete-policy to:
+`argocd.argoproj.io/hook-delete-policy: BeforeHookCreation`
+```yaml
+metadata:
+  name: prepare-dns
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation #HookSucceeded
+```
+  - After re-apply and re-sync on pods list appear the hook's pod:
+```bash
+   kubectl get pods -n cert-manager
+```
+  - Output: `prepare-dns-7d9p5 0/1     Completed   0          26s` 
+---
+#### Task 5: Multi-cluster management (Hub-Spoke model)
+  - Note: `k3d` clusters used here
 
+ `a. ` Create cluster network named `k3d`
+```bash
+   docker network create k3d-net
+```
+ - Note: using a **named** network like `k3d-net` is strongly recommended because:
+
+   - **Stable DNS resolution:**
+   k3d injects CoreDNS NodeHosts entries that map each cluster node’s DNS name (e.g. k3d-target-server-0) to its Docker‐assigned IP. On Docker Desktop restarts these ephemeral networks usually change, which can break the mgmt-cluster→target-cluster connection. A named network survives restarts, so the IPs stay fixed.
+
+   - **Easier cluster discovery:**
+   When clusters share one network, you can refer to the target API server by name (e.g. https://k3d-target-server-0:6443) without extra port-forwards or host overrides.
+
+   - **Better cleanup and isolation:**
+   You can tear both clusters down with one docker network rm k3d-net, and you won’t accidentally collide with other containers you’re running on the default bridge.
+   
+`b. ` Create 2 clusters on the `k3d-net` network:
+```bash
+   k3d cluster create mgmt --network k3d-net --wait --agents 0
+k3d cluster create target --network k3d-net --wait
+```
+  - Ensure the created clusters exists:
+  ```bash
+     kubectl config get-contexts
+  ``` 
+  Output: 
+   ```text
+      CURRENT   NAME                  CLUSTER               AUTHINFO                 NAMESPACE
+                k3d-mgmt              k3d-mgmt              admin@k3d-mgmt           
+      *         k3d-target            k3d-target            admin@k3d-target         
+   ``` 
+   - Note: The star (*) is on k3d-target, meaning you’re currently “inside” the target cluster.
+
+   - Switch to the management cluster:
+   ```bash
+      kubectl config use-context k3d-mgmt
+   ```
+   - Verify cross-cluster connectivity:
+```bash
+  # Retrieve the spoke API server IP
+echo "Retrieving spoke API server IP..."
+export TARGET_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' k3d-target-server-0)
+echo "TARGET_IP=$TARGET_IP"
+
+# Launch a temporary pod in the hub cluster, passing TARGET_IP
+echo "Testing connectivity from hub to spoke..."
+kubectl run curl-test \
+  --context k3d-mgmt \
+  --image=curlimages/curl:latest \
+  --restart=Never --rm -i --tty \
+  --env TARGET_IP="$TARGET_IP" \
+  -- sh
+
+# Inside the pod, run:
+ping -c3 "$TARGET_IP"                      # ICMP reachability
+curl -vk "https://$TARGET_IP:6443/version"   # TLS handshake + API (401 = expected)
+
+# Exit to terminate the pod
+exit
+```
+   - Install Argo CD into the hub (k3d-mgmt):
+```bash
+   helm repo add argo https://argoproj.github.io/argo-helm
+   helm repo update
+   helm install argocd argo/argo-cd \
+     --namespace argocd --create-namespace \
+     --version $(helm search repo argo/argo-cd --versions \
+       | awk 'NR==2{print $2}')
+   
+   # Rollout the server deployment
+   kubectl rollout status deploy/argocd-server -n argocd
+```
+   - Prepare the **spoke** for Argo CD registration
+- 1. Switch to the spoke cluster (k3d-target)
+```bash
+  kubectl config use-context k3d-target
+```
+- 2. On the spoke cluster, create a ServiceAccount in kube-system and bind cluster-admin (for demo purposes).
+```bash
+   # Create ServiceAccount
+kubectl apply -n kube-system -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-manager
+EOF
+
+# Bind cluster-admin role
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-manager-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: argocd-manager
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+EOF
+```
+
+- 3. Grab the `spoke's` secret name, extract the bearer token and CA
+```bash      
+  SECRET=$(kubectl -n kube-system get sa argocd-manager -o jsonpath='{.secrets[0].name}')
+  TOKEN=$(kubectl -n kube-system get secret $SECRET -o jsonpath='{.data.token}' | base64 -d)
+  CA=$(kubectl -n kube-system get secret $SECRET -o jsonpath='{.data.ca\.crt}')
+```
+- 4. Switch back to the hub cluster (k3d-mgmt)
+```bash
+  kubectl config use-context k3d-mgmt
+```
+- 5. Register the spoke with Argo CD (applied on the `hub`)
+```bash
+   cat <<EOF | kubectl apply -n argocd -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k3d-target-cluster
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+type: Opaque
+stringData:
+  name: k3d-target
+  server: https://k3d-target-server-0:6443
+  config: |
+    {
+      "bearerToken": "${TOKEN}",
+      "tlsClientConfig": {
+        "insecure": false,
+        "caData": "${CA}"
+      }
+    }
+EOF
+```
+
+- 6. Port-forward and login.
+   - Note: run in separate terminal
+```bash
+   kubectl --context k3d-mgmt port-forward svc/argocd-server -n argocd 8080:443
+```
+- 7. Login to the Argo CD
+```bash
+   # Extract admin password
+export ARGO_PWD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d)
+
+# Log in via CLI
+argocd login localhost:8080 \
+  --username admin \
+  --password "$ARGO_PWD" \
+  --insecure
+```
+
+- 8. List Argo CD apps and clusters
+```bash
+   # List apps & clusters
+argocd app list
+argocd cluster list
+```
+- 9. Deploy and sync the appropraite OCI registry chart
+  ```yaml
+     # secrets/hub-cluster-oci-repo.yaml
+     apiVersion: v1
+        kind: Secret
+        metadata:
+          name: hub-oci-repo
+          namespace: argocd
+          labels:
+            argocd.argoproj.io/secret-type: repository
+        stringData:
+          url: registry-1.docker.io/alkon100
+          name: alkon100
+          type: helm
+          enableOCI: "true"
+  ```
+  ```yaml
+     # manifests/busybox-test-app.yaml
+     apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: busybox-test-cf
+          namespace: argocd
+        spec:
+          destination:
+            namespace: cert-manager
+              server: https://k3d-target-server-0:6443
+        # test deploy on the hub cluster
+        #    server: https://kubernetes.default.svc
+            source:
+              repoURL: registry-1.docker.io/alkon100
+              chart: busybox-test-chart
+              targetRevision: v1.0.1
+            project: default
+            syncPolicy:
+              automated:
+              prune: true
+              selfHeal: true
+              syncOptions:
+                - CreateNamespace=true 
+  ```
+
+```bash
+   kubectl apply -f secrets/hub-cluster-oci-repo.yaml
+   kubectl apply -f manifests/busybox-test-app.yaml
+```
+- 10. Verify the workload on the **spoke** cluster:
+```bash
+    kubectl --context k3d-target -n argocd get pods
+```
+       
   
   
   
